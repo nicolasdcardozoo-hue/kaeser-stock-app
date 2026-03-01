@@ -125,6 +125,10 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_ml['stock_sugerido_ia'] = modelo_xgb.predict(X)
                 df_ml['stock_sugerido_ia'] = np.ceil(df_ml['stock_sugerido_ia']).clip(lower=0)
 
+                # 🛑 NUEVA REGLA ESTRICTA: Cero consumo = Cero stock (Freno a la IA)
+                df_ml['stock_sugerido_ia'] = np.where(df_ml['promedio_consumo_mensual'] == 0, 0, df_ml['stock_sugerido_ia'])
+
+                # APLICAR REGLAS LOGÍSTICAS KAESER
                 df_ml['stock_sugerido_ia'] = np.where(
                     df_ml['valor_redondeo'] > 0,
                     np.ceil(df_ml['stock_sugerido_ia'] / df_ml['valor_redondeo']) * df_ml['valor_redondeo'],
@@ -136,6 +140,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     df_ml['lote_minimo'].replace(0, 999999)
                 )
 
+                # REGLA DE MATERIAL CRÍTICO (Esta salva a los críticos incluso si su consumo fue cero)
                 df_ml['stock_seguridad_FINAL_Kaeser'] = np.where(
                     (df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & 
                     (df_ml['stock_seguridad_FINAL_Kaeser'] < df_ml['stock_seguridad_actual_3420']),
@@ -143,7 +148,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     df_ml['stock_seguridad_FINAL_Kaeser']
                 )
 
-                # --- LÓGICA DEL SEMÁFORO ---
+                # --- LÓGICA DEL SEMÁFORO DE ALERTAS ---
                 denominador = df_ml['stock_seguridad_3400'] + df_ml['stock_seguridad_FINAL_Kaeser']
                 df_ml['nivel_abastecimiento_pct'] = np.where(denominador > 0, (df_ml['stock_actual_3420'] / denominador) * 100, 100)
                 
@@ -164,7 +169,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
 
                 # --- GUARDAR EN LA MEMORIA DE LA PÁGINA ---
                 st.session_state.df_procesado = df_ml
-                st.success("¡Análisis completado! Los datos se han guardado.")
+                st.success("¡Análisis completado! Los datos se han guardado en memoria.")
 
             except Exception as e:
                 st.error(f"❌ Ocurrió un error al procesar los archivos: {e}")
@@ -188,7 +193,7 @@ if st.session_state.df_procesado is not None:
         c4.success(f"🟢 Altos (>80%): {len(df_ml[df_ml['alerta'] == '🟢 Alto'])}")
         
         st.markdown("**Filtro Rápido:**")
-        # Ahora el filtro ya NO reinicia el proceso porque los datos están guardados
+        # El filtro ya NO reinicia el proceso porque los datos están guardados
         filtro_alerta = st.selectbox("Selecciona un nivel de alerta para ver los repuestos:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
         
         df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
@@ -204,7 +209,7 @@ if st.session_state.df_procesado is not None:
         columnas_finales = [
             'codigo_material', 'descripcion', 'tipo_material', 'clasificacion_abc', 
             'promedio_consumo_mensual', 'lead_time_dias', 'stock_seguridad_actual_3420', 
-            'lote_minimo', 'valor_redondeo', 'stock_seguridad_FINAL_Kaeser'
+            'lote_minimo', 'valor_redondeo', 'stock_sugerido_ia', 'stock_seguridad_FINAL_Kaeser'
         ]
         df_resultado = df_ml[columnas_finales]
         st.dataframe(df_resultado, use_container_width=True)
