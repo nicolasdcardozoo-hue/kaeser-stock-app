@@ -9,6 +9,10 @@ st.set_page_config(page_title="Kaeser - IA & Dashboard", layout="wide")
 st.title("⚙️ Sistema Integral de Abastecimiento - Kaeser Medellín")
 st.markdown("Sube los reportes de SAP. El sistema calculará el Stock de Seguridad óptimo y generará las alertas semanales automáticas.")
 
+# --- LA MAGIA DE LA MEMORIA (SESSION STATE) ---
+if 'df_procesado' not in st.session_state:
+    st.session_state.df_procesado = None
+
 # 1. Zona de carga de archivos
 with st.expander("📂 Haz clic aquí para subir los archivos de SAP", expanded=True):
     col1, col2 = st.columns(2)
@@ -28,7 +32,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
     if file_md07 and file_vl06o and file_zmd04 and file_rmm and file_mcbe and file_plantilla:
         with st.spinner("Procesando datos, calculando IA y generando alertas..."):
             try:
-                # --- PIPELINE DE DATOS (Mismo de antes) ---
+                # --- PIPELINE DE DATOS ---
                 df_md07 = pd.read_excel(file_md07)
                 df_md07 = df_md07[['Material', 'Descripción del material', 'Stock de seguridad', 'Stock de centro']].copy()
                 df_md07.columns = ['codigo_material', 'descripcion', 'stock_seguridad_actual_3420', 'stock_actual_3420']
@@ -139,9 +143,8 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     df_ml['stock_seguridad_FINAL_Kaeser']
                 )
 
-                # --- NUEVO: LÓGICA DEL SEMÁFORO DE ALERTAS KAESER ---
-                # Fórmula Oficial: Cantidad disponible / (Stock seguridad Tenjo + Stock seguridad Sucursales) x 100
-                denominador = df_ml['stock_seguridad_3400'] + df_ml['stock_seguridad_FINAL_Kaeser'] # Usamos el sugerido ideal
+                # --- LÓGICA DEL SEMÁFORO ---
+                denominador = df_ml['stock_seguridad_3400'] + df_ml['stock_seguridad_FINAL_Kaeser']
                 df_ml['nivel_abastecimiento_pct'] = np.where(denominador > 0, (df_ml['stock_actual_3420'] / denominador) * 100, 100)
                 
                 def clasificar_alerta(pct):
@@ -152,7 +155,6 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 
                 df_ml['alerta'] = df_ml['nivel_abastecimiento_pct'].apply(clasificar_alerta)
                 
-                # Sugerencia de pedido inmediato (Respeta cajas/redondeo)
                 df_ml['faltante'] = df_ml['stock_seguridad_FINAL_Kaeser'] - df_ml['stock_actual_3420']
                 df_ml['sugerencia_pedido_urgente'] = np.where(
                     df_ml['faltante'] > 0,
@@ -160,54 +162,60 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     0
                 )
 
-                st.success("¡Análisis completado! Navega por las pestañas para ver los resultados.")
-
-                # --- INTERFAZ DE PESTAÑAS (TABS) ---
-                tab1, tab2 = st.tabs(["🚨 Dashboard de Alertas Semanal", "🤖 Optimización IA (Revisión Larga)"])
-
-                with tab1:
-                    st.subheader("Monitoreo de Nivel de Abastecimiento")
-                    
-                    # Tarjetas de resumen para las alertas
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.error(f"🔴 Críticos (<25%): {len(df_ml[df_ml['alerta'] == '🔴 Crítico'])}")
-                    c2.warning(f"🟠 Bajos (26-50%): {len(df_ml[df_ml['alerta'] == '🟠 Bajo'])}")
-                    c3.info(f"🟡 Medios (51-80%): {len(df_ml[df_ml['alerta'] == '🟡 Medio'])}")
-                    c4.success(f"🟢 Altos (>80%): {len(df_ml[df_ml['alerta'] == '🟢 Alto'])}")
-                    
-                    st.markdown("**Filtro Rápido:**")
-                    filtro_alerta = st.selectbox("Selecciona un nivel de alerta para ver los repuestos:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
-                    
-                    df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
-                    df_dashboard['nivel_abastecimiento_pct'] = df_dashboard['nivel_abastecimiento_pct'].round(1).astype(str) + "%"
-                    
-                    if filtro_alerta != 'Todos':
-                        df_dashboard = df_dashboard[df_dashboard['alerta'] == filtro_alerta]
-                    
-                    st.dataframe(df_dashboard.sort_values(by='sugerencia_pedido_urgente', ascending=False), use_container_width=True)
-
-                with tab2:
-                    st.subheader("Resultados Completos de la Inteligencia Artificial")
-                    columnas_finales = [
-                        'codigo_material', 'descripcion', 'tipo_material', 'clasificacion_abc', 
-                        'promedio_consumo_mensual', 'lead_time_dias', 'stock_seguridad_actual_3420', 
-                        'lote_minimo', 'valor_redondeo', 'stock_seguridad_FINAL_Kaeser'
-                    ]
-                    df_resultado = df_ml[columnas_finales]
-                    st.dataframe(df_resultado, use_container_width=True)
-
-                    output = BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df_ml.to_excel(writer, index=False, sheet_name='Base Completa')
-                    
-                    st.download_button(
-                        label="📥 Descargar Excel con Toda la Información",
-                        data=output.getvalue(),
-                        file_name="Optimizacion_y_Alertas_Kaeser.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                # --- GUARDAR EN LA MEMORIA DE LA PÁGINA ---
+                st.session_state.df_procesado = df_ml
+                st.success("¡Análisis completado! Los datos se han guardado.")
 
             except Exception as e:
                 st.error(f"❌ Ocurrió un error al procesar los archivos: {e}")
     else:
         st.warning("⚠️ Por favor, sube los 6 archivos antes de iniciar el sistema.")
+
+# --- RENDERIZAR INTERFAZ SI LA MEMORIA TIENE DATOS ---
+if st.session_state.df_procesado is not None:
+    # Rescatamos la tabla de la memoria
+    df_ml = st.session_state.df_procesado
+
+    tab1, tab2 = st.tabs(["🚨 Dashboard de Alertas Semanal", "🤖 Optimización IA (Revisión Larga)"])
+
+    with tab1:
+        st.subheader("Monitoreo de Nivel de Abastecimiento")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.error(f"🔴 Críticos (<25%): {len(df_ml[df_ml['alerta'] == '🔴 Crítico'])}")
+        c2.warning(f"🟠 Bajos (26-50%): {len(df_ml[df_ml['alerta'] == '🟠 Bajo'])}")
+        c3.info(f"🟡 Medios (51-80%): {len(df_ml[df_ml['alerta'] == '🟡 Medio'])}")
+        c4.success(f"🟢 Altos (>80%): {len(df_ml[df_ml['alerta'] == '🟢 Alto'])}")
+        
+        st.markdown("**Filtro Rápido:**")
+        # Ahora el filtro ya NO reinicia el proceso porque los datos están guardados
+        filtro_alerta = st.selectbox("Selecciona un nivel de alerta para ver los repuestos:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
+        
+        df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
+        df_dashboard['nivel_abastecimiento_pct'] = df_dashboard['nivel_abastecimiento_pct'].round(1).astype(str) + "%"
+        
+        if filtro_alerta != 'Todos':
+            df_dashboard = df_dashboard[df_dashboard['alerta'] == filtro_alerta]
+        
+        st.dataframe(df_dashboard.sort_values(by='sugerencia_pedido_urgente', ascending=False), use_container_width=True)
+
+    with tab2:
+        st.subheader("Resultados Completos de la Inteligencia Artificial")
+        columnas_finales = [
+            'codigo_material', 'descripcion', 'tipo_material', 'clasificacion_abc', 
+            'promedio_consumo_mensual', 'lead_time_dias', 'stock_seguridad_actual_3420', 
+            'lote_minimo', 'valor_redondeo', 'stock_seguridad_FINAL_Kaeser'
+        ]
+        df_resultado = df_ml[columnas_finales]
+        st.dataframe(df_resultado, use_container_width=True)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_ml.to_excel(writer, index=False, sheet_name='Base Completa')
+        
+        st.download_button(
+            label="📥 Descargar Excel con Toda la Información",
+            data=output.getvalue(),
+            file_name="Optimizacion_y_Alertas_Kaeser.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
