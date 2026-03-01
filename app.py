@@ -7,9 +7,8 @@ from io import BytesIO
 st.set_page_config(page_title="Kaeser - IA & Dashboard", layout="wide")
 
 st.title("⚙️ Sistema Integral de Abastecimiento - Kaeser Medellín")
-st.markdown("Sube los reportes de SAP. El sistema calculará el Stock de Seguridad óptimo y generará las alertas semanales automáticas.")
+st.markdown("Sube los reportes de SAP. El sistema calculará el Stock de Seguridad óptimo aplicando IA y escudos protectores de logística (Consumos esporádicos y Status de Alemania).")
 
-# --- LA MAGIA DE LA MEMORIA (SESSION STATE) ---
 if 'df_procesado' not in st.session_state:
     st.session_state.df_procesado = None
 
@@ -23,14 +22,14 @@ with st.expander("📂 Haz clic aquí para subir los archivos de SAP", expanded=
     with col2:
         file_rmm = st.file_uploader("4. Archivo RMMDMDMA (Lotes Mínimos)", type=['xlsx'])
         file_mcbe = st.file_uploader("5. Archivo MCBE (Valor Monetario)", type=['xlsx'])
-        file_plantilla = st.file_uploader("6. Plantilla K.MEDELLIN (Tipo y ABC)", type=['xlsx'])
+        file_plantilla = st.file_uploader("6. Plantilla K.MEDELLIN (Tipo, ABC y Status)", type=['xlsx'])
 
 st.markdown("---")
 
 # 2. Botón de Ejecución Maestro
 if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
     if file_md07 and file_vl06o and file_zmd04 and file_rmm and file_mcbe and file_plantilla:
-        with st.spinner("Procesando datos, calculando IA y generando alertas..."):
+        with st.spinner("Procesando datos, calculando IA y aplicando escudos logísticos..."):
             try:
                 # --- PIPELINE DE DATOS ---
                 df_md07 = pd.read_excel(file_md07)
@@ -67,12 +66,17 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_mov = df_mov[df_mov['documento_entrega'].str.startswith('801') | df_mov['documento_entrega'].str.startswith('84')].copy()
                 df_mov['cantidad_consumo_real'] = df_mov.apply(lambda row: abs(row['cantidad']) if row['documento_entrega'].startswith('801') else -abs(row['cantidad']), axis=1)
                 
-                df_consumo_total = df_mov.groupby('codigo_material')['cantidad_consumo_real'].sum().reset_index()
-                df_consumo_total.columns = ['codigo_material', 'consumo_total_historico']
+                # Novedad: Calcular la cantidad y la FRECUENCIA de consumos (¿Se movió 1 vez o muchas veces?)
+                df_consumo_total = df_mov.groupby('codigo_material').agg(
+                    consumo_total_historico=('cantidad_consumo_real', 'sum'),
+                    frecuencia_consumo=('documento_entrega', 'nunique')
+                ).reset_index()
+                
                 df_consumo_total['promedio_consumo_mensual'] = df_consumo_total['consumo_total_historico'] / 12
 
                 df_cruce = pd.merge(df_cruce, df_consumo_total, on='codigo_material', how='left')
                 df_cruce['promedio_consumo_mensual'] = df_cruce['promedio_consumo_mensual'].fillna(0)
+                df_cruce['frecuencia_consumo'] = df_cruce['frecuencia_consumo'].fillna(0)
 
                 df_rmm = pd.read_excel(file_rmm)
                 df_lotes = df_rmm[['Material', 'Valor de redondeo', 'Tamaño lote mínimo']].copy()
@@ -97,15 +101,19 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_cruce = pd.merge(df_cruce, df_valor[['codigo_material', 'costo_unitario']], on='codigo_material', how='left')
                 df_cruce['costo_unitario'] = df_cruce['costo_unitario'].fillna(0)
 
+                # Novedad: Extraer la columna STATUS de la plantilla de Kaeser
                 df_plantilla_k = pd.read_excel(file_plantilla, sheet_name='3420', skiprows=8)
-                df_tipo = df_plantilla_k[['NUMERO DE PARTE', 'ABC', 'TIPO']].copy()
-                df_tipo.columns = ['codigo_material', 'clasificacion_abc', 'tipo_material']
+                col_status = [c for c in df_plantilla_k.columns if 'STATUS' in str(c).upper()][0] # Buscamos el nombre exacto
+                
+                df_tipo = df_plantilla_k[['NUMERO DE PARTE', 'ABC', 'TIPO', col_status]].copy()
+                df_tipo.columns = ['codigo_material', 'clasificacion_abc', 'tipo_material', 'status_alemania']
                 df_tipo = df_tipo.dropna(subset=['codigo_material'])
                 df_tipo['codigo_material'] = df_tipo['codigo_material'].astype(str).str.strip()
                 
                 df_cruce = pd.merge(df_cruce, df_tipo, on='codigo_material', how='left')
                 df_cruce['clasificacion_abc'] = df_cruce['clasificacion_abc'].fillna('Sin Clasificar')
                 df_cruce['tipo_material'] = df_cruce['tipo_material'].fillna('Otros')
+                df_cruce['status_alemania'] = df_cruce['status_alemania'].fillna('')
 
                 # --- MACHINE LEARNING ---
                 df_ml = df_cruce.copy()
@@ -125,10 +133,26 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_ml['stock_sugerido_ia'] = modelo_xgb.predict(X)
                 df_ml['stock_sugerido_ia'] = np.ceil(df_ml['stock_sugerido_ia']).clip(lower=0)
 
-                # 🛑 NUEVA REGLA ESTRICTA: Cero consumo = Cero stock (Freno a la IA)
+                # --- ESCUDOS PROTECTORES DE LOGÍSTICA (FRENOS A LA IA) ---
+                
+                # Freno 1: Si no tiene consumos, el stock es 0
                 df_ml['stock_sugerido_ia'] = np.where(df_ml['promedio_consumo_mensual'] == 0, 0, df_ml['stock_sugerido_ia'])
 
-                # APLICAR REGLAS LOGÍSTICAS KAESER
+                # Freno 2 (NUEVO): Consumo esporádico (Ej. Se despachó solo 1 vez para un proyecto)
+                # Si NO es crítico, NO tenía stock en Medellin, NO tenía en Tenjo, y se movió 1 vez o menos -> Stock 0
+                condicion_esporadico = (
+                    (~df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & 
+                    (df_ml['stock_seguridad_actual_3420'] == 0) & 
+                    (df_ml['stock_seguridad_3400'] == 0) & 
+                    (df_ml['frecuencia_consumo'] <= 1)
+                )
+                df_ml['stock_sugerido_ia'] = np.where(condicion_esporadico, 0, df_ml['stock_sugerido_ia'])
+
+                # Freno 3 (NUEVO): Estatus bloqueado en Alemania
+                # Si la columna status tiene algo (no está vacía), forzamos a 0 el sugerido de la IA
+                df_ml['stock_sugerido_ia'] = np.where(df_ml['status_alemania'] != '', 0, df_ml['stock_sugerido_ia'])
+
+                # --- APLICAR REGLAS LOGÍSTICAS DE CAJAS ---
                 df_ml['stock_sugerido_ia'] = np.where(
                     df_ml['valor_redondeo'] > 0,
                     np.ceil(df_ml['stock_sugerido_ia'] / df_ml['valor_redondeo']) * df_ml['valor_redondeo'],
@@ -140,15 +164,18 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     df_ml['lote_minimo'].replace(0, 999999)
                 )
 
-                # REGLA DE MATERIAL CRÍTICO (Esta salva a los críticos incluso si su consumo fue cero)
+                # --- ESCUDO FINAL: PROTEGER LOS MATERIALES CRÍTICOS ---
+                # Incluso con los frenos, si es Crítico y la IA le bajó el stock, mantenemos su stock actual de salvavidas.
+                # PERO si tiene STATUS en Alemania, no lo salvamos.
                 df_ml['stock_seguridad_FINAL_Kaeser'] = np.where(
                     (df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & 
-                    (df_ml['stock_seguridad_FINAL_Kaeser'] < df_ml['stock_seguridad_actual_3420']),
+                    (df_ml['stock_seguridad_FINAL_Kaeser'] < df_ml['stock_seguridad_actual_3420']) &
+                    (df_ml['status_alemania'] == ''),
                     df_ml['stock_seguridad_actual_3420'],
                     df_ml['stock_seguridad_FINAL_Kaeser']
                 )
 
-                # --- LÓGICA DEL SEMÁFORO DE ALERTAS ---
+                # --- LÓGICA DEL SEMÁFORO ---
                 denominador = df_ml['stock_seguridad_3400'] + df_ml['stock_seguridad_FINAL_Kaeser']
                 df_ml['nivel_abastecimiento_pct'] = np.where(denominador > 0, (df_ml['stock_actual_3420'] / denominador) * 100, 100)
                 
@@ -167,7 +194,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     0
                 )
 
-                # --- GUARDAR EN LA MEMORIA DE LA PÁGINA ---
+                # --- GUARDAR EN LA MEMORIA ---
                 st.session_state.df_procesado = df_ml
                 st.success("¡Análisis completado! Los datos se han guardado en memoria.")
 
@@ -178,7 +205,6 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
 
 # --- RENDERIZAR INTERFAZ SI LA MEMORIA TIENE DATOS ---
 if st.session_state.df_procesado is not None:
-    # Rescatamos la tabla de la memoria
     df_ml = st.session_state.df_procesado
 
     tab1, tab2 = st.tabs(["🚨 Dashboard de Alertas Semanal", "🤖 Optimización IA (Revisión Larga)"])
@@ -193,10 +219,9 @@ if st.session_state.df_procesado is not None:
         c4.success(f"🟢 Altos (>80%): {len(df_ml[df_ml['alerta'] == '🟢 Alto'])}")
         
         st.markdown("**Filtro Rápido:**")
-        # El filtro ya NO reinicia el proceso porque los datos están guardados
         filtro_alerta = st.selectbox("Selecciona un nivel de alerta para ver los repuestos:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
         
-        df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
+        df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'status_alemania', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
         df_dashboard['nivel_abastecimiento_pct'] = df_dashboard['nivel_abastecimiento_pct'].round(1).astype(str) + "%"
         
         if filtro_alerta != 'Todos':
@@ -207,9 +232,9 @@ if st.session_state.df_procesado is not None:
     with tab2:
         st.subheader("Resultados Completos de la Inteligencia Artificial")
         columnas_finales = [
-            'codigo_material', 'descripcion', 'tipo_material', 'clasificacion_abc', 
-            'promedio_consumo_mensual', 'lead_time_dias', 'stock_seguridad_actual_3420', 
-            'lote_minimo', 'valor_redondeo', 'stock_sugerido_ia', 'stock_seguridad_FINAL_Kaeser'
+            'codigo_material', 'descripcion', 'tipo_material', 'status_alemania', 'clasificacion_abc', 
+            'promedio_consumo_mensual', 'frecuencia_consumo', 'lead_time_dias', 'stock_seguridad_actual_3420', 
+            'lote_minimo', 'valor_redondeo', 'stock_seguridad_FINAL_Kaeser'
         ]
         df_resultado = df_ml[columnas_finales]
         st.dataframe(df_resultado, use_container_width=True)
