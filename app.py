@@ -12,6 +12,28 @@ st.markdown("Plataforma de optimización de Stock de Seguridad con IA, basada en
 if 'df_procesado' not in st.session_state:
     st.session_state.df_procesado = None
 
+# --- LECTOR INTELIGENTE DE ARCHIVOS ---
+def leer_archivo_inteligente(file, buscar_columna=None):
+    """Lee el archivo, limpia espacios en columnas y busca en todas las pestañas si es necesario."""
+    if file.name.endswith('.csv'):
+        df = pd.read_csv(file)
+        df.columns = df.columns.astype(str).str.strip() # Limpia espacios invisibles
+        return df
+    
+    # Si es Excel, verificamos las pestañas
+    xls = pd.ExcelFile(file)
+    if buscar_columna:
+        for hoja in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=hoja)
+            df.columns = df.columns.astype(str).str.strip()
+            if buscar_columna in df.columns:
+                return df # Encontró la pestaña correcta, la devuelve
+                
+    # Si no hay columna específica a buscar, lee la primera hoja
+    df = pd.read_excel(xls, sheet_name=0)
+    df.columns = df.columns.astype(str).str.strip()
+    return df
+
 # 1. Zona de carga de archivos (Arquitectura Limpia v4)
 with st.expander("📂 Haz clic aquí para subir los archivos fuente", expanded=True):
     col1, col2 = st.columns(2)
@@ -28,18 +50,12 @@ with st.expander("📂 Haz clic aquí para subir los archivos fuente", expanded=
 
 st.markdown("---")
 
-# Función auxiliar para leer excel o csv
-def leer_archivo(file):
-    if file.name.endswith('.csv'):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
-
 if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
     if file_vl06o and file_zmd04 and file_rmm and file_mcbe and file_diccionario and file_finanzas:
         with st.spinner("Construyendo el modelo de datos y ejecutando IA..."):
             try:
                 # --- PASO 1: MCBE (Base principal) ---
-                df_mcbe = leer_archivo(file_mcbe)
+                df_mcbe = leer_archivo_inteligente(file_mcbe)
                 col_mat_mcbe = 'P/N' if 'P/N' in df_mcbe.columns else 'Material'
                 df_base = df_mcbe[[col_mat_mcbe, 'CtdStkTot.', 'ValStkVal']].copy()
                 df_base.columns = ['codigo_material', 'stock_actual_3420', 'valor_total']
@@ -52,7 +68,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_base = df_base.drop(columns=['valor_total'])
 
                 # --- PASO 2: RMMDMDMA (Lotes y Stock Seguridad Actual Medellín) ---
-                df_rmm = leer_archivo(file_rmm)
+                df_rmm = leer_archivo_inteligente(file_rmm)
                 df_lotes = df_rmm[['Material', 'Valor de redondeo', 'Tamaño lote mínimo', 'Stock de seguridad']].copy()
                 df_lotes.columns = ['codigo_material', 'valor_redondeo', 'lote_minimo', 'stock_seguridad_actual_3420']
                 df_lotes['codigo_material'] = df_lotes['codigo_material'].astype(str).str.strip()
@@ -60,13 +76,20 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_cruce = pd.merge(df_base, df_lotes, on='codigo_material', how='left').fillna(0)
 
                 # --- PASO 3: ZMD04 (Tenjo y Status Alemania) ---
-                df_zmd04 = leer_archivo(file_zmd04)
-                col_status = [c for c in df_zmd04.columns if 'STATUS' in str(c).upper()][0]
-                df_tenjo = df_zmd04[['Material', 'Stock de seguridad', col_status]].copy()
-                df_tenjo.columns = ['codigo_material', 'stock_seguridad_3400', 'status_alemania']
-                df_tenjo['codigo_material'] = df_tenjo['codigo_material'].astype(str).str.strip()
-                df_tenjo['status_alemania'] = df_tenjo['status_alemania'].fillna('')
+                df_zmd04 = leer_archivo_inteligente(file_zmd04)
                 
+                # Buscar la columna Status dinámicamente de forma segura
+                col_status_list = [c for c in df_zmd04.columns if 'STATUS' in str(c).upper()]
+                if col_status_list:
+                    col_status = col_status_list[0]
+                    df_tenjo = df_zmd04[['Material', 'Stock de seguridad', col_status]].copy()
+                    df_tenjo.columns = ['codigo_material', 'stock_seguridad_3400', 'status_alemania']
+                else:
+                    df_tenjo = df_zmd04[['Material', 'Stock de seguridad']].copy()
+                    df_tenjo.columns = ['codigo_material', 'stock_seguridad_3400']
+                    df_tenjo['status_alemania'] = ''
+
+                df_tenjo['codigo_material'] = df_tenjo['codigo_material'].astype(str).str.strip()
                 df_cruce = pd.merge(df_cruce, df_tenjo, on='codigo_material', how='left')
                 df_cruce['stock_seguridad_3400'] = df_cruce['stock_seguridad_3400'].fillna(0)
                 df_cruce['status_alemania'] = df_cruce['status_alemania'].fillna('')
@@ -78,7 +101,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_cruce['lead_time_dias'] = df_cruce.apply(calcular_lead_time, axis=1)
 
                 # --- PASO 4: DICCIONARIO LOGÍSTICA ---
-                df_dicc = leer_archivo(file_diccionario)
+                df_dicc = leer_archivo_inteligente(file_diccionario)
                 df_dicc = df_dicc[['Material', 'Descripción', 'Tipo de Mercancia', 'Tipo de Material', 'Procedencia']].copy()
                 df_dicc.columns = ['codigo_material', 'descripcion', 'tipo_mercancia', 'tipo_material', 'procedencia']
                 df_dicc['codigo_material'] = df_dicc['codigo_material'].astype(str).str.strip()
@@ -92,22 +115,25 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 # Filtro: Solo analizar Repuestos
                 df_cruce = df_cruce[df_cruce['tipo_mercancia'].str.upper().str.contains('REPUESTO')].copy()
 
-                # --- PASO 5: REPORTE FINANZAS (ABC) CORREGIDO ---
-                df_fin = leer_archivo(file_finanzas)
+                # --- PASO 5: REPORTE FINANZAS (ABC) ---
+                # AQUI ESTA LA MAGIA: Le decimos que busque pestaña por pestaña hasta encontrar 'ABC'
+                df_fin = leer_archivo_inteligente(file_finanzas, buscar_columna='ABC')
                 
-                # Buscamos la columna inteligentemente
-                col_mat_fin = 'Partenúmero' if 'Partenúmero' in df_fin.columns else ('P/N' if 'P/N' in df_fin.columns else 'Material')
+                # Busca 'Partenúmero', si no lo encuentra busca 'P/N', sino 'Material'
+                if 'Partenúmero' in df_fin.columns: col_mat_fin = 'Partenúmero'
+                elif 'P/N' in df_fin.columns: col_mat_fin = 'P/N'
+                else: col_mat_fin = 'Material'
                 
                 df_fin = df_fin[[col_mat_fin, 'ABC']].copy()
                 df_fin.columns = ['codigo_material', 'clasificacion_abc']
                 df_fin['codigo_material'] = df_fin['codigo_material'].astype(str).str.strip()
-                df_fin = df_fin.drop_duplicates(subset=['codigo_material']) # Por si acaso Finanzas trae repetidos
+                df_fin = df_fin.drop_duplicates(subset=['codigo_material'])
                 
                 df_cruce = pd.merge(df_cruce, df_fin, on='codigo_material', how='left')
                 df_cruce['clasificacion_abc'] = df_cruce['clasificacion_abc'].fillna('Sin Clasificar')
 
                 # --- PASO 6: VL06O (Consumos) ---
-                df_vl06o = leer_archivo(file_vl06o)
+                df_vl06o = leer_archivo_inteligente(file_vl06o)
                 df_mov = df_vl06o[['Entrega', 'Cantidad entrega', 'Material']].copy()
                 df_mov.columns = ['documento_entrega', 'cantidad', 'codigo_material']
                 df_mov = df_mov.dropna(subset=['documento_entrega', 'codigo_material'])
@@ -184,7 +210,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 st.success("¡Análisis completado! Modelo de datos 100% integrado.")
 
             except Exception as e:
-                st.error(f"❌ Error al procesar: {e}.")
+                st.error(f"❌ Error al procesar: {e}")
     else:
         st.info("⚠️ Sube los 6 archivos requeridos para iniciar el sistema.")
 
