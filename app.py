@@ -7,57 +7,104 @@ from io import BytesIO
 st.set_page_config(page_title="Kaeser - IA & Dashboard", layout="wide")
 
 st.title("⚙️ Sistema Integral de Abastecimiento - Kaeser Medellín")
-st.markdown("Sube los reportes de SAP. El sistema calculará el Stock de Seguridad óptimo aplicando IA y escudos protectores de logística (Consumos esporádicos y Status de Alemania).")
+st.markdown("Plataforma de optimización de Stock de Seguridad con IA, basada en el Maestro de Materiales y reglas logísticas corporativas.")
 
 if 'df_procesado' not in st.session_state:
     st.session_state.df_procesado = None
 
-# 1. Zona de carga de archivos
-with st.expander("📂 Haz clic aquí para subir los archivos de SAP", expanded=True):
+# 1. Zona de carga de archivos (Arquitectura Limpia v4)
+with st.expander("📂 Haz clic aquí para subir los archivos fuente", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
-        file_md07 = st.file_uploader("1. Archivo MD07 (Stock Medellín)", type=['xlsx'])
-        file_vl06o = st.file_uploader("2. Archivo VL06O (Movimientos)", type=['xlsx'])
-        file_zmd04 = st.file_uploader("3. Archivo ZMD04 (Stock Tenjo)", type=['xlsx'])
+        st.markdown("**Datos de SAP (Operativos)**")
+        file_vl06o = st.file_uploader("1. Archivo VL06O (Movimientos)", type=['xlsx', 'csv'])
+        file_zmd04 = st.file_uploader("2. Archivo ZMD04 (Stock Tenjo y Status)", type=['xlsx', 'csv'])
+        file_rmm = st.file_uploader("3. Archivo RMMDMDMA (Lotes y Stock Actual)", type=['xlsx', 'csv'])
+        file_mcbe = st.file_uploader("4. Archivo MCBE (Cantidades y Valor)", type=['xlsx', 'csv'])
     with col2:
-        file_rmm = st.file_uploader("4. Archivo RMMDMDMA (Lotes Mínimos)", type=['xlsx'])
-        file_mcbe = st.file_uploader("5. Archivo MCBE (Valor Monetario)", type=['xlsx'])
-        file_plantilla = st.file_uploader("6. Plantilla K.MEDELLIN (Tipo, ABC y Status)", type=['xlsx'])
+        st.markdown("**Diccionarios (Maestros)**")
+        file_diccionario = st.file_uploader("5. Diccionario General (Tipo, Procedencia)", type=['xlsx', 'csv'])
+        file_finanzas = st.file_uploader("6. Reporte Finanzas (Clasificación ABC)", type=['xlsx', 'csv'])
 
 st.markdown("---")
 
-# 2. Botón de Ejecución Maestro
+# Función auxiliar para leer excel o csv
+def leer_archivo(file):
+    if file.name.endswith('.csv'):
+        return pd.read_csv(file)
+    return pd.read_excel(file)
+
 if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
-    if file_md07 and file_vl06o and file_zmd04 and file_rmm and file_mcbe and file_plantilla:
-        with st.spinner("Procesando datos, calculando IA y aplicando escudos logísticos..."):
+    if file_vl06o and file_zmd04 and file_rmm and file_mcbe and file_diccionario and file_finanzas:
+        with st.spinner("Construyendo el modelo de datos y ejecutando IA..."):
             try:
-                # --- PIPELINE DE DATOS ---
-                df_md07 = pd.read_excel(file_md07)
-                df_md07 = df_md07[['Material', 'Descripción del material', 'Stock de seguridad', 'Stock de centro']].copy()
-                df_md07.columns = ['codigo_material', 'descripcion', 'stock_seguridad_actual_3420', 'stock_actual_3420']
-                df_md07 = df_md07.dropna(subset=['codigo_material'])
-                df_md07['codigo_material'] = df_md07['codigo_material'].astype(str).str.strip()
+                # --- PASO 1: MCBE (Base principal) ---
+                df_mcbe = leer_archivo(file_mcbe)
+                # Soportar si viene como 'P/N' o 'Material'
+                col_mat_mcbe = 'P/N' if 'P/N' in df_mcbe.columns else 'Material'
+                df_base = df_mcbe[[col_mat_mcbe, 'CtdStkTot.', 'ValStkVal']].copy()
+                df_base.columns = ['codigo_material', 'stock_actual_3420', 'valor_total']
+                df_base = df_base.dropna(subset=['codigo_material'])
+                df_base['codigo_material'] = df_base['codigo_material'].astype(str).str.strip()
+                df_base = df_base.drop_duplicates(subset=['codigo_material'])
+                
+                df_base['stock_actual_3420'] = df_base['stock_actual_3420'].fillna(0)
+                df_base['costo_unitario'] = np.where(df_base['stock_actual_3420'] > 0, df_base['valor_total'] / df_base['stock_actual_3420'], 0)
+                df_base = df_base.drop(columns=['valor_total'])
 
-                df_zmd04 = pd.read_excel(file_zmd04)
-                df_tenjo = df_zmd04[['Material', 'Stock de seguridad']].copy()
-                df_tenjo.columns = ['codigo_material', 'stock_seguridad_3400']
-                df_tenjo = df_tenjo.dropna(subset=['codigo_material'])
+                # --- PASO 2: RMMDMDMA (Lotes y Stock Seguridad Actual Medellín) ---
+                df_rmm = leer_archivo(file_rmm)
+                df_lotes = df_rmm[['Material', 'Valor de redondeo', 'Tamaño lote mínimo', 'Stock de seguridad']].copy()
+                df_lotes.columns = ['codigo_material', 'valor_redondeo', 'lote_minimo', 'stock_seguridad_actual_3420']
+                df_lotes['codigo_material'] = df_lotes['codigo_material'].astype(str).str.strip()
+                
+                df_cruce = pd.merge(df_base, df_lotes, on='codigo_material', how='left').fillna(0)
+
+                # --- PASO 3: ZMD04 (Tenjo y Status Alemania) ---
+                df_zmd04 = leer_archivo(file_zmd04)
+                # Extraer la columna que tenga la palabra Status
+                col_status = [c for c in df_zmd04.columns if 'STATUS' in str(c).upper()][0]
+                df_tenjo = df_zmd04[['Material', 'Stock de seguridad', col_status]].copy()
+                df_tenjo.columns = ['codigo_material', 'stock_seguridad_3400', 'status_alemania']
                 df_tenjo['codigo_material'] = df_tenjo['codigo_material'].astype(str).str.strip()
-                df_tenjo = df_tenjo[df_tenjo['codigo_material'].str.match(r'^[1-9]')].copy() 
-
-                df_cruce = pd.merge(df_md07, df_tenjo, on='codigo_material', how='left')
+                df_tenjo['status_alemania'] = df_tenjo['status_alemania'].fillna('')
+                
+                df_cruce = pd.merge(df_cruce, df_tenjo, on='codigo_material', how='left')
                 df_cruce['stock_seguridad_3400'] = df_cruce['stock_seguridad_3400'].fillna(0)
+                df_cruce['status_alemania'] = df_cruce['status_alemania'].fillna('')
 
                 def calcular_lead_time(fila):
-                    ss_medellin = fila['stock_seguridad_actual_3420']
-                    ss_tenjo = fila['stock_seguridad_3400']
-                    if ss_tenjo > 0: return 7
-                    elif ss_tenjo == 0 and ss_medellin > 0: return 62
+                    if fila['stock_seguridad_3400'] > 0: return 7
+                    elif fila['stock_seguridad_3400'] == 0 and fila['stock_seguridad_actual_3420'] > 0: return 62
                     else: return 55
-
                 df_cruce['lead_time_dias'] = df_cruce.apply(calcular_lead_time, axis=1)
 
-                df_vl06o = pd.read_excel(file_vl06o)
+                # --- PASO 4: DICCIONARIO LOGÍSTICA (El nuevo archivo que subiste) ---
+                df_dicc = leer_archivo(file_diccionario)
+                df_dicc = df_dicc[['Material', 'Descripción', 'Tipo de Mercancia', 'Tipo de Material', 'Procedencia']].copy()
+                df_dicc.columns = ['codigo_material', 'descripcion', 'tipo_mercancia', 'tipo_material', 'procedencia']
+                df_dicc['codigo_material'] = df_dicc['codigo_material'].astype(str).str.strip()
+                
+                df_cruce = pd.merge(df_cruce, df_dicc, on='codigo_material', how='left')
+                df_cruce['tipo_mercancia'] = df_cruce['tipo_mercancia'].fillna('Desconocido')
+                df_cruce['tipo_material'] = df_cruce['tipo_material'].fillna('Otros')
+                df_cruce['procedencia'] = df_cruce['procedencia'].fillna('Desconocido')
+                df_cruce['descripcion'] = df_cruce['descripcion'].fillna('Sin descripción')
+
+                # ¡FILTRO DE ORO! Solo analizar "Repuestos"
+                df_cruce = df_cruce[df_cruce['tipo_mercancia'].str.upper().str.contains('REPUESTO')].copy()
+
+                # --- PASO 5: REPORTE FINANZAS (ABC) ---
+                df_fin = leer_archivo(file_finanzas)
+                df_fin = df_fin[['Material', 'ABC']].copy()
+                df_fin.columns = ['codigo_material', 'clasificacion_abc']
+                df_fin['codigo_material'] = df_fin['codigo_material'].astype(str).str.strip()
+                
+                df_cruce = pd.merge(df_cruce, df_fin, on='codigo_material', how='left')
+                df_cruce['clasificacion_abc'] = df_cruce['clasificacion_abc'].fillna('Sin Clasificar')
+
+                # --- PASO 6: VL06O (Consumos) ---
+                df_vl06o = leer_archivo(file_vl06o)
                 df_mov = df_vl06o[['Entrega', 'Cantidad entrega', 'Material']].copy()
                 df_mov.columns = ['documento_entrega', 'cantidad', 'codigo_material']
                 df_mov = df_mov.dropna(subset=['documento_entrega', 'codigo_material'])
@@ -66,54 +113,15 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_mov = df_mov[df_mov['documento_entrega'].str.startswith('801') | df_mov['documento_entrega'].str.startswith('84')].copy()
                 df_mov['cantidad_consumo_real'] = df_mov.apply(lambda row: abs(row['cantidad']) if row['documento_entrega'].startswith('801') else -abs(row['cantidad']), axis=1)
                 
-                # Novedad: Calcular la cantidad y la FRECUENCIA de consumos (¿Se movió 1 vez o muchas veces?)
-                df_consumo_total = df_mov.groupby('codigo_material').agg(
+                df_consumo = df_mov.groupby('codigo_material').agg(
                     consumo_total_historico=('cantidad_consumo_real', 'sum'),
                     frecuencia_consumo=('documento_entrega', 'nunique')
                 ).reset_index()
-                
-                df_consumo_total['promedio_consumo_mensual'] = df_consumo_total['consumo_total_historico'] / 12
+                df_consumo['promedio_consumo_mensual'] = df_consumo['consumo_total_historico'] / 12
 
-                df_cruce = pd.merge(df_cruce, df_consumo_total, on='codigo_material', how='left')
+                df_cruce = pd.merge(df_cruce, df_consumo, on='codigo_material', how='left')
                 df_cruce['promedio_consumo_mensual'] = df_cruce['promedio_consumo_mensual'].fillna(0)
                 df_cruce['frecuencia_consumo'] = df_cruce['frecuencia_consumo'].fillna(0)
-
-                df_rmm = pd.read_excel(file_rmm)
-                df_lotes = df_rmm[['Material', 'Valor de redondeo', 'Tamaño lote mínimo']].copy()
-                df_lotes.columns = ['codigo_material', 'valor_redondeo', 'lote_minimo']
-                df_lotes = df_lotes.dropna(subset=['codigo_material'])
-                df_lotes['codigo_material'] = df_lotes['codigo_material'].astype(str).str.strip()
-                
-                df_cruce = pd.merge(df_cruce, df_lotes, on='codigo_material', how='left')
-                df_cruce['valor_redondeo'] = df_cruce['valor_redondeo'].fillna(0)
-                df_cruce['lote_minimo'] = df_cruce['lote_minimo'].fillna(0)
-
-                df_mcbe = pd.read_excel(file_mcbe)
-                df_valor = df_mcbe[['P/N', 'CtdStkTot.', 'ValStkVal']].copy()
-                df_valor.columns = ['codigo_material', 'cantidad_total', 'valor_total']
-                df_valor = df_valor.dropna(subset=['codigo_material'])
-                df_valor['codigo_material'] = df_valor['codigo_material'].astype(str).str.strip()
-                df_valor = df_valor.drop_duplicates(subset=['codigo_material'])
-                df_valor['cantidad_total'] = df_valor['cantidad_total'].fillna(0)
-                df_valor['valor_total'] = df_valor['valor_total'].fillna(0)
-                df_valor['costo_unitario'] = np.where(df_valor['cantidad_total'] > 0, df_valor['valor_total'] / df_valor['cantidad_total'], 0)
-                
-                df_cruce = pd.merge(df_cruce, df_valor[['codigo_material', 'costo_unitario']], on='codigo_material', how='left')
-                df_cruce['costo_unitario'] = df_cruce['costo_unitario'].fillna(0)
-
-                # Novedad: Extraer la columna STATUS de la plantilla de Kaeser
-                df_plantilla_k = pd.read_excel(file_plantilla, sheet_name='3420', skiprows=8)
-                col_status = [c for c in df_plantilla_k.columns if 'STATUS' in str(c).upper()][0] # Buscamos el nombre exacto
-                
-                df_tipo = df_plantilla_k[['NUMERO DE PARTE', 'ABC', 'TIPO', col_status]].copy()
-                df_tipo.columns = ['codigo_material', 'clasificacion_abc', 'tipo_material', 'status_alemania']
-                df_tipo = df_tipo.dropna(subset=['codigo_material'])
-                df_tipo['codigo_material'] = df_tipo['codigo_material'].astype(str).str.strip()
-                
-                df_cruce = pd.merge(df_cruce, df_tipo, on='codigo_material', how='left')
-                df_cruce['clasificacion_abc'] = df_cruce['clasificacion_abc'].fillna('Sin Clasificar')
-                df_cruce['tipo_material'] = df_cruce['tipo_material'].fillna('Otros')
-                df_cruce['status_alemania'] = df_cruce['status_alemania'].fillna('')
 
                 # --- MACHINE LEARNING ---
                 df_ml = df_cruce.copy()
@@ -133,40 +141,24 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                 df_ml['stock_sugerido_ia'] = modelo_xgb.predict(X)
                 df_ml['stock_sugerido_ia'] = np.ceil(df_ml['stock_sugerido_ia']).clip(lower=0)
 
-                # --- ESCUDOS PROTECTORES DE LOGÍSTICA (FRENOS A LA IA) ---
-                
-                # Freno 1: Si no tiene consumos, el stock es 0
+                # --- ESCUDOS PROTECTORES ---
+                # 1. Sin consumo = Sin stock
                 df_ml['stock_sugerido_ia'] = np.where(df_ml['promedio_consumo_mensual'] == 0, 0, df_ml['stock_sugerido_ia'])
-
-                # Freno 2 (NUEVO): Consumo esporádico (Ej. Se despachó solo 1 vez para un proyecto)
-                # Si NO es crítico, NO tenía stock en Medellin, NO tenía en Tenjo, y se movió 1 vez o menos -> Stock 0
-                condicion_esporadico = (
-                    (~df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & 
-                    (df_ml['stock_seguridad_actual_3420'] == 0) & 
-                    (df_ml['stock_seguridad_3400'] == 0) & 
-                    (df_ml['frecuencia_consumo'] <= 1)
-                )
-                df_ml['stock_sugerido_ia'] = np.where(condicion_esporadico, 0, df_ml['stock_sugerido_ia'])
-
-                # Freno 3 (NUEVO): Estatus bloqueado en Alemania
-                # Si la columna status tiene algo (no está vacía), forzamos a 0 el sugerido de la IA
+                
+                # 2. Esporádicos (1 sola vez) y no críticos = Sin stock
+                cond_esporadico = (~df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & (df_ml['stock_seguridad_actual_3420'] == 0) & (df_ml['stock_seguridad_3400'] == 0) & (df_ml['frecuencia_consumo'] <= 1)
+                df_ml['stock_sugerido_ia'] = np.where(cond_esporadico, 0, df_ml['stock_sugerido_ia'])
+                
+                # 3. Status Alemania bloqueado
                 df_ml['stock_sugerido_ia'] = np.where(df_ml['status_alemania'] != '', 0, df_ml['stock_sugerido_ia'])
 
-                # --- APLICAR REGLAS LOGÍSTICAS DE CAJAS ---
-                df_ml['stock_sugerido_ia'] = np.where(
-                    df_ml['valor_redondeo'] > 0,
-                    np.ceil(df_ml['stock_sugerido_ia'] / df_ml['valor_redondeo']) * df_ml['valor_redondeo'],
-                    df_ml['stock_sugerido_ia']
-                )
+                # Redondeo por cajas
+                df_ml['stock_sugerido_ia'] = np.where(df_ml['valor_redondeo'] > 0, np.ceil(df_ml['stock_sugerido_ia'] / df_ml['valor_redondeo']) * df_ml['valor_redondeo'], df_ml['stock_sugerido_ia'])
+                
+                # Respetar Lote Mínimo
+                df_ml['stock_seguridad_FINAL_Kaeser'] = np.minimum(df_ml['stock_sugerido_ia'], df_ml['lote_minimo'].replace(0, 999999))
 
-                df_ml['stock_seguridad_FINAL_Kaeser'] = np.minimum(
-                    df_ml['stock_sugerido_ia'], 
-                    df_ml['lote_minimo'].replace(0, 999999)
-                )
-
-                # --- ESCUDO FINAL: PROTEGER LOS MATERIALES CRÍTICOS ---
-                # Incluso con los frenos, si es Crítico y la IA le bajó el stock, mantenemos su stock actual de salvavidas.
-                # PERO si tiene STATUS en Alemania, no lo salvamos.
+                # 4. Proteger los Críticos
                 df_ml['stock_seguridad_FINAL_Kaeser'] = np.where(
                     (df_ml['tipo_material'].str.upper().str.contains('CRITICO|CRÍTICO')) & 
                     (df_ml['stock_seguridad_FINAL_Kaeser'] < df_ml['stock_seguridad_actual_3420']) &
@@ -175,7 +167,7 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     df_ml['stock_seguridad_FINAL_Kaeser']
                 )
 
-                # --- LÓGICA DEL SEMÁFORO ---
+                # --- DASHBOARD & ALERTAS ---
                 denominador = df_ml['stock_seguridad_3400'] + df_ml['stock_seguridad_FINAL_Kaeser']
                 df_ml['nivel_abastecimiento_pct'] = np.where(denominador > 0, (df_ml['stock_actual_3420'] / denominador) * 100, 100)
                 
@@ -194,34 +186,30 @@ if st.button("🚀 Procesar Datos y Generar Dashboard", type="primary"):
                     0
                 )
 
-                # --- GUARDAR EN LA MEMORIA ---
                 st.session_state.df_procesado = df_ml
-                st.success("¡Análisis completado! Los datos se han guardado en memoria.")
+                st.success("¡Análisis completado! Modelo de datos 100% integrado.")
 
             except Exception as e:
-                st.error(f"❌ Ocurrió un error al procesar los archivos: {e}")
+                st.error(f"❌ Error al procesar: {e}. Verifica que las columnas de Finanzas se llamen 'Material' y 'ABC'.")
     else:
-        st.warning("⚠️ Por favor, sube los 6 archivos antes de iniciar el sistema.")
+        st.info("⚠️ Sube los 6 archivos requeridos para iniciar el sistema.")
 
-# --- RENDERIZAR INTERFAZ SI LA MEMORIA TIENE DATOS ---
 if st.session_state.df_procesado is not None:
     df_ml = st.session_state.df_procesado
 
-    tab1, tab2 = st.tabs(["🚨 Dashboard de Alertas Semanal", "🤖 Optimización IA (Revisión Larga)"])
+    tab1, tab2 = st.tabs(["🚨 Dashboard Semanal", "🤖 Optimización IA (Maestro Completo)"])
 
     with tab1:
-        st.subheader("Monitoreo de Nivel de Abastecimiento")
-        
+        st.subheader("Monitoreo de Nivel de Abastecimiento (Solo Repuestos)")
         c1, c2, c3, c4 = st.columns(4)
         c1.error(f"🔴 Críticos (<25%): {len(df_ml[df_ml['alerta'] == '🔴 Crítico'])}")
         c2.warning(f"🟠 Bajos (26-50%): {len(df_ml[df_ml['alerta'] == '🟠 Bajo'])}")
         c3.info(f"🟡 Medios (51-80%): {len(df_ml[df_ml['alerta'] == '🟡 Medio'])}")
         c4.success(f"🟢 Altos (>80%): {len(df_ml[df_ml['alerta'] == '🟢 Alto'])}")
         
-        st.markdown("**Filtro Rápido:**")
-        filtro_alerta = st.selectbox("Selecciona un nivel de alerta para ver los repuestos:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
+        filtro_alerta = st.selectbox("Filtro de acción rápida:", ['Todos', '🔴 Crítico', '🟠 Bajo', '🟡 Medio', '🟢 Alto'])
         
-        df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'status_alemania', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
+        df_dashboard = df_ml[['codigo_material', 'descripcion', 'tipo_material', 'procedencia', 'stock_actual_3420', 'stock_seguridad_FINAL_Kaeser', 'nivel_abastecimiento_pct', 'alerta', 'sugerencia_pedido_urgente']].copy()
         df_dashboard['nivel_abastecimiento_pct'] = df_dashboard['nivel_abastecimiento_pct'].round(1).astype(str) + "%"
         
         if filtro_alerta != 'Todos':
@@ -232,7 +220,7 @@ if st.session_state.df_procesado is not None:
     with tab2:
         st.subheader("Resultados Completos de la Inteligencia Artificial")
         columnas_finales = [
-            'codigo_material', 'descripcion', 'tipo_material', 'status_alemania', 'clasificacion_abc', 
+            'codigo_material', 'descripcion', 'tipo_material', 'procedencia', 'status_alemania', 'clasificacion_abc', 
             'promedio_consumo_mensual', 'frecuencia_consumo', 'lead_time_dias', 'stock_seguridad_actual_3420', 
             'lote_minimo', 'valor_redondeo', 'stock_seguridad_FINAL_Kaeser'
         ]
@@ -243,9 +231,4 @@ if st.session_state.df_procesado is not None:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_ml.to_excel(writer, index=False, sheet_name='Base Completa')
         
-        st.download_button(
-            label="📥 Descargar Excel con Toda la Información",
-            data=output.getvalue(),
-            file_name="Optimizacion_y_Alertas_Kaeser.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("📥 Descargar Excel Ejecutivo", data=output.getvalue(), file_name="Optimizacion_Kaeser_V4.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
